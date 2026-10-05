@@ -3,17 +3,14 @@
 
 from __future__ import annotations
 
-import argparse
 import json
-import logging
 import os
 import sqlite3
-import subprocess
-import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 
 class MemorySystem:
@@ -79,7 +76,7 @@ class MemorySystem:
 
 
 class CodingAgent:
-    """Minimal coding agent used by Brighton."""
+    """Minimal coding agent that stays compatible with Brighton's orchestrator."""
 
     def __init__(self, safety=None):
         self.safety = safety
@@ -88,11 +85,16 @@ class CodingAgent:
         request = str(request).strip()
         if not request:
             return ""
+
+        # Conservative local generation: do not pretend to be a model.
+        # This is a simple code synthesis helper that is still controlled by Brighton.
         if "factorial" in request.lower() and "python" in request.lower():
             return """def factorial(n):\n    if not isinstance(n, int):\n        raise TypeError('n must be an integer')\n    if n < 0:\n        raise ValueError('n must be non-negative')\n    result = 1\n    for i in range(2, n + 1):\n        result *= i\n    return result\n"""
+
         if "calculator" in request.lower() and "python" in request.lower():
             return """class Calculator:\n    def add(self, a, b):\n        return a + b\n\n    def subtract(self, a, b):\n        return a - b\n\n    def multiply(self, a, b):\n        return a * b\n\n    def divide(self, a, b):\n        if b == 0:\n            raise ValueError('division by zero')\n        return a / b\n"""
-        return """def answer():\n    return 'Brighton generated this code stub.'\n"""
+
+        return """def answer():\n    return 'Brighton generated this local code stub.'\n"""
 
     def health(self) -> Dict[str, Any]:
         return {"ready": True, "mode": "local"}
@@ -193,8 +195,10 @@ class SafetyManager:
         return {"success": True, "path": str(target)}
 
     def execute_command(self, command: str) -> Dict[str, Any]:
+        # Basic safe shell runner: no shell metacharacters in the command.
         if any(token in command for token in ["&", "|", ";", "&&", "||", ">>", "<", "$"]):
             return {"success": False, "reason": "unsafe command", "stdout": "", "stderr": "Unsafe shell operators are forbidden."}
+        import subprocess
         result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
         return {"success": result.returncode == 0, "return_code": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
 
@@ -227,7 +231,513 @@ class EvolutionEngine:
         self._closed = True
 
 
-# Real local neural brain implementation for Brighton.
+"""
+The real local neural brain for Brighton.
+
+This class intentionally keeps the public interface stable:
+- status()
+- health_check()
+- generate(...)
+- generate_text(...)
+
+The model is replaceable and local-only.
+"""
+
+from __future__ import annotations
+
+import gc
+import json
+import os
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+
+@dataclass
+class LocalModelSpec:
+    path: str
+    backend: str
+    size_mb: int
+    valid: bool = True
+    reason: str = ""
+
+
+@dataclass
+class GenerationConfig:
+    temperature: float = 0.7
+    top_k: int = 40
+    top_p: float = 0.9
+    repetition_penalty: float = 1.08
+    max_tokens: int = 256
+    stop_sequences: List[str] = field(default_factory=lambda: ["\n\nUser:", "\nUser:", "</s>"])
+    context_length: int = 2048
+    deterministic: bool = False
+    stream: bool = False
+
+
+class ModelManager:
+    """Discovers and manages one local GGUF model at a time."""
+
+    def __init__(self, base_dir: Optional[Path] = None):
+        self.base_dir = Path(base_dir or Path(__file__).resolve().parents[1]).resolve()
+        self.models_dir = self.base_dir / "models"
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+        self.current_model: Optional[object] = None
+        self.current_model_path: Optional[str] = None
+        self.current_backend: Optional[str] = None
+        self.model_info: Optional[LocalModelSpec] = None
+        self.lock = threading.RLock()
+
+    def discover(self) -> List[LocalModelSpec]:
+        candidates: List[LocalModelSpec] = []
+        if not self.models_dir.exists():
+            return candidates
+
+        for p in sorted(self.models_dir.iterdir()):
+            if not p.is_file():
+                continue
+            if p.suffix.lower() not in {".gguf", ".ggml", ".bin"}:
+                continue
+            size_mb = max(1, int(p.stat().st_size / (1024 * 1024)))
+            candidates.append(
+                LocalModelSpec(
+                    path=str(p.resolve()),
+                    backend="unknown",
+                    size_mb=size_mb,
+                    valid=True,
+                    reason="candidate",
+                )
+            )
+        return candidates
+
+    def validate_model_file(self, model_path: str) -> Tuple[bool, str]:
+        p = Path(model_path).expanduser()
+        if not p.exists():
+            return False, "missing model file"
+        if not p.is_file():
+            return False, "not a regular file"
+        if p.suffix.lower() not in {".gguf", ".ggml", ".bin"}:
+            return False, "unsupported model format; expected GGUF or compatible local quantized model"
+        size = p.stat().st_size
+        if size <= 0:
+            return False, "empty model file"
+        return True, "ok"
+
+    def _backend_available(self) -> Optional[str]:
+        try:
+            import llama_cpp  # type: ignore
+            return "llama_cpp"
+        except Exception:
+            pass
+        try:
+            import ctransformers  # type: ignore
+            return "ctransformers"
+        except Exception:
+            pass
+        return None
+
+    def load_model(self, model_path: Optional[str] = None, prefer_backend: Optional[str] = None) -> Dict[str, Any]:
+        if model_path is None:
+            discovered = self.discover()
+            if not discovered:
+                return {
+                    "status": "unavailable",
+                    "reason": "no local model found in models/",
+                    "recommended_action": "Download a small GGUF model and place it in ./models",
+                }
+            model_path = discovered[0].path
+
+        ok, reason = self.validate_model_file(model_path)
+        if not ok:
+            return {
+                "status": "invalid",
+                "reason": reason,
+                "model_path": model_path,
+            }
+
+        backend = prefer_backend or self._backend_available()
+        if backend is None:
+            return {
+                "status": "backend_unavailable",
+                "reason": "No supported local backend is installed",
+                "recommended_action": "Install llama-cpp-python or ctransformers for local CPU inference",
+            }
+
+        with self.lock:
+            if self.current_model is not None and self.current_model_path == model_path:
+                return {
+                    "status": "already_loaded",
+                    "backend": self.current_backend,
+                    "model_path": model_path,
+                }
+
+            try:
+                if backend == "llama_cpp":
+                    import llama_cpp  # type: ignore
+
+                    model = llama_cpp.Llama(
+                        model_path=model_path,
+                        n_ctx=2048,
+                        n_gpu_layers=0,
+                        n_batch=256,
+                        n_threads=max(1, min(2, os.cpu_count() or 2)),
+                        verbose=False,
+                    )
+                elif backend == "ctransformers":
+                    from ctransformers import AutoModelForCausalLM  # type: ignore
+
+                    model = AutoModelForCausalLM.from_pretrained(
+                        model_path,
+                        model_type="llama",
+                        gpu_layers=0,
+                        context_length=2048,
+                        threads=max(1, min(2, os.cpu_count() or 2)),
+                    )
+                else:
+                    return {
+                        "status": "unsupported_backend",
+                        "reason": f"Unsupported backend: {backend}",
+                    }
+
+                self.current_model = model
+                self.current_model_path = model_path
+                self.current_backend = backend
+                self.model_info = LocalModelSpec(
+                    path=model_path,
+                    backend=backend,
+                    size_mb=max(1, int(Path(model_path).stat().st_size / (1024 * 1024))),
+                    valid=True,
+                    reason="loaded",
+                )
+                return {
+                    "status": "loaded",
+                    "backend": backend,
+                    "model_path": model_path,
+                }
+            except Exception as exc:
+                return {
+                    "status": "load_failed",
+                    "reason": str(exc),
+                    "recommended_action": "Verify the GGUF file is valid and compatible with the installed backend",
+                }
+
+    def unload(self) -> Dict[str, Any]:
+        with self.lock:
+            try:
+                self.current_model = None
+                self.current_model_path = None
+                self.current_backend = None
+                self.model_info = None
+                gc.collect()
+                return {"status": "unloaded"}
+            except Exception as exc:
+                return {"status": "unload_failed", "reason": str(exc)}
+
+    def info(self) -> Dict[str, Any]:
+        return {
+            "discovered": self.discover(),
+            "loaded_model": self.current_model_path,
+            "backend": self.current_backend,
+        }
+
+
+class ResourceManager:
+    """Protects Brighton from trying to load unsafe models on limited RAM."""
+
+    def __init__(self):
+        self._cpu_count = max(1, min(2, os.cpu_count() or 2))
+
+    def available_ram_mb(self) -> int:
+        try:
+            import psutil  # type: ignore
+            return int(psutil.virtual_memory().available / (1024 * 1024))
+        except Exception:
+            return 1024
+
+    def safe_thread_count(self) -> int:
+        return self._cpu_count
+
+    def estimate_model_memory_mb(self, file_path: str) -> int:
+        try:
+            size = Path(file_path).stat().st_size
+            return max(128, int(size / (1024 * 1024)) + 256)
+        except Exception:
+            return 512
+
+    def can_load(self, model_path: str) -> Tuple[bool, str]:
+        ram_mb = self.available_ram_mb()
+        estimated = self.estimate_model_memory_mb(model_path)
+        reserve_mb = 512
+        if ram_mb < 1200:
+            return False, f"insufficient RAM: {ram_mb} MB available, model requires roughly {estimated} MB"
+        if estimated > max(512, ram_mb - reserve_mb):
+            return False, f"unsafe model load: estimated {estimated} MB exceeds a safe limit for {ram_mb} MB free RAM"
+        return True, "safe to load"
+
+
+class ContextManager:
+    """Builds bounded project-aware prompts without dumping the entire repo."""
+
+    def __init__(self, project_root: Optional[Path] = None):
+        self.project_root = Path(project_root or Path(__file__).resolve().parents[1]).resolve()
+
+    def summarize_project(self, project_root: Optional[Path] = None) -> str:
+        root = project_root or self.project_root
+        if not root.exists():
+            return "Project directory unavailable."
+
+        files = []
+        for p in sorted(root.rglob("*.py"))[:25]:
+            rel = p.relative_to(root)
+            files.append(str(rel))
+        if not files:
+            return "No Python files were found in the project."
+        return "Project files: " + ", ".join(files[:15])
+
+    def build_prompt(self, user_message: str, conversation: Optional[List[Dict[str, str]]] = None, memory: Optional[List[str]] = None, project_info: Optional[str] = None, error_context: Optional[str] = None) -> str:
+        conversation_block = ""
+        if conversation:
+            recent = conversation[-4:]
+            for turn in recent:
+                speaker = turn.get("speaker", "User")
+                text = turn.get("text", "")
+                conversation_block += f"{speaker}: {text}\n"
+
+        memory_block = ""
+        if memory:
+            memory_block = "Relevant memory:\n" + "\n".join(f"- {item}" for item in memory[:3]) + "\n"
+
+        project_block = project_info or self.summarize_project()
+        error_block = f"Errors:\n{error_context}\n" if error_context else ""
+
+        prompt = (
+            "You are Brighton, a local coding assistant running on a constrained CPU machine. "
+            "Answer clearly and accurately with concise, useful technical reasoning.\n\n"
+            f"Context:\n{project_block}\n\n"
+            f"{memory_block}"
+            f"{conversation_block}"
+            f"{error_block}"
+            f"User request:\n{user_message}\n\n"
+            "Provide a direct, valuable response optimized for coding work.\n"
+        )
+        return prompt[:3500]
+
+
+class GenerationEngine:
+    """Thin wrapper around a local inference backend."""
+
+    def __init__(self, default_config: Optional[GenerationConfig] = None):
+        self.config = default_config or GenerationConfig()
+
+    def generate(self, model: Any, prompt: str, config: Optional[GenerationConfig] = None) -> str:
+        if model is None:
+            raise RuntimeError("Model unavailable")
+
+        g = config or self.config
+        backend = getattr(model, "__class__", type(model)).__module__
+        try:
+            if "llama_cpp" in backend:
+                result = model(
+                    prompt,
+                    max_tokens=g.max_tokens,
+                    temperature=g.temperature,
+                    top_k=g.top_k,
+                    top_p=g.top_p,
+                    repeat_penalty=g.repetition_penalty,
+                    stop=g.stop_sequences,
+                    stream=g.stream,
+                    echo=False,
+                )
+                text = result["choices"][0]["text"] if isinstance(result, dict) and "choices" in result else str(result)
+                return text.strip()
+
+            if "ctransformers" in backend:
+                text = model(prompt, max_new_tokens=g.max_tokens, temperature=g.temperature, top_k=g.top_k, top_p=g.top_p, repetition_penalty=g.repetition_penalty, stop=g.stop_sequences)
+                return str(text).strip()
+
+            return "Model backend is present but no supported generation call was found."
+        except Exception as exc:
+            raise RuntimeError(f"generation failed: {exc}") from exc
+
+
+class ConversationEngine:
+    def __init__(self):
+        self.history: List[Dict[str, str]] = []
+
+    def add_turn(self, speaker: str, text: str) -> None:
+        self.history.append({"speaker": speaker, "text": str(text)})
+        if len(self.history) > 12:
+            self.history = self.history[-12:]
+
+    def recent(self) -> List[Dict[str, str]]:
+        return list(self.history)
+
+
+class BrightonBrain:
+    """Stable local neural brain interface for Brighton."""
+
+    def __init__(self, model_path: Optional[str] = None, offline_mode: bool = True, project_root: Optional[Path] = None):
+        self.base_dir = Path(project_root or Path(__file__).resolve().parents[1]).resolve()
+        self.offline_mode = bool(offline_mode)
+        self.model_manager = ModelManager(self.base_dir)
+        self.resource_manager = ResourceManager()
+        self.context_manager = ContextManager(self.base_dir)
+        self.generation_engine = GenerationEngine()
+        self.conversation = ConversationEngine()
+        self.memory: List[str] = []
+        self._last_error: Optional[str] = None
+
+        if model_path is None:
+            discovered = self.model_manager.discover()
+            if discovered:
+                model_path = discovered[0].path
+
+        if model_path:
+            self.load_model(model_path)
+
+    def load_model(self, model_path: str) -> Dict[str, Any]:
+        ok, reason = self.resource_manager.can_load(model_path)
+        if not ok:
+            return {
+                "status": "unavailable",
+                "reason": reason,
+                "recommended_action": "Reduce the model size or free memory before loading it",
+            }
+
+        result = self.model_manager.load_model(model_path)
+        self._last_error = result.get("reason") if result.get("status") != "loaded" else None
+        return result
+
+    def unload_model(self) -> Dict[str, Any]:
+        return self.model_manager.unload()
+
+    def add_memory(self, memory_text: str) -> None:
+        if memory_text:
+            self.memory.append(str(memory_text))
+            if len(self.memory) > 5:
+                self.memory = self.memory[-5:]
+
+    def add_context(self, key: str, value: str) -> None:
+        self.conversation.add_turn(key, value)
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "name": "BrightonBrain",
+            "offline_mode": self.offline_mode,
+            "backend": self.model_manager.current_backend,
+            "loaded_model": self.model_manager.current_model_path,
+            "available_models": [m.path for m in self.model_manager.discover()],
+            "memory": self.memory,
+            "conversation_turns": len(self.conversation.history),
+        }
+
+    def health_check(self) -> Dict[str, Any]:
+        if self.model_manager.current_model is not None:
+            return {"ready_for_inference": True, "model_loaded": True, "offline_mode": self.offline_mode, "backend": self.model_manager.current_backend}
+
+        discovered = self.model_manager.discover()
+        if discovered:
+            return {
+                "ready_for_inference": False,
+                "model_loaded": False,
+                "offline_mode": self.offline_mode,
+                "backend": self.model_manager.current_backend,
+                "reason": "model discovered but not loaded",
+                "recommended_action": "Call load_model() with a valid GGUF file or place model.gguf in ./models",
+            }
+
+        return {
+            "ready_for_inference": False,
+            "model_loaded": False,
+            "offline_mode": self.offline_mode,
+            "backend": "unavailable",
+            "reason": "Model unavailable",
+            "recommended_action": "Download a small GGUF model such as a 0.5B–1.5B coding/ instruct model and store it in ./models",
+        }
+
+    def generate(self, prompt: str, **kwargs: Any) -> Dict[str, Any]:
+        user_prompt = str(prompt or "")
+        if not user_prompt:
+            return {"error": "empty prompt", "model_available": False}
+
+        if self.offline_mode:
+            # The model is local only; no cloud or web access is permitted.
+            pass
+
+        if self.model_manager.current_model is None:
+            discovered = self.model_manager.discover()
+            if discovered:
+                load_result = self.load_model(discovered[0].path)
+                if load_result.get("status") != "loaded":
+                    return {
+                        "error": "Model unavailable",
+                        "reason": load_result.get("reason", "unknown"),
+                        "recommended_action": load_result.get("recommended_action", "Check the local model file and backend installation"),
+                        "model_available": False,
+                    }
+            else:
+                return {
+                    "error": "Model unavailable",
+                    "reason": "No compatible local model file was found in the models directory",
+                    "recommended_action": "Place a small GGUF file in ./models and ensure llama-cpp-python or ctransformers is installed",
+                    "model_available": False,
+                }
+
+        project_info = self.context_manager.summarize_project(self.base_dir)
+        built_prompt = self.context_manager.build_prompt(
+            user_message=user_prompt,
+            conversation=self.conversation.history,
+            memory=self.memory,
+            project_info=project_info,
+        )
+
+        try:
+            text = self.generation_engine.generate(self.model_manager.current_model, built_prompt)
+            self.conversation.add_turn("User", user_prompt)
+            self.conversation.add_turn("Brighton", text)
+            return {
+                "text": text,
+                "model_available": True,
+                "backend": self.model_manager.current_backend,
+                "result": text,
+            }
+        except Exception as exc:
+            self._last_error = str(exc)
+            return {
+                "error": "Model unavailable",
+                "reason": str(exc),
+                "recommended_action": "Verify the model file, backend installation, and memory limits before retrying",
+                "model_available": False,
+            }
+
+    def generate_text(self, prompt: str, **kwargs: Any) -> str:
+        result = self.generate(prompt, **kwargs)
+        if result.get("error"):
+            return f"Model unavailable\nReason: {result.get('reason', 'unknown')}\nRecommended action: {result.get('recommended_action', 'check model installation and memory')}"
+        return str(result.get("text") or result.get("result") or "")
+
+    def __repr__(self) -> str:
+        return "BrightonBrain(local_model_manager=enabled)"
+
+
+__all__ = [
+    "BrightonBrain",
+    "ContextManager",
+    "ConversationEngine",
+    "GenerationConfig",
+    "GenerationEngine",
+    "ModelManager",
+    "ResourceManager",
+]
+
+"""
+Compatibility shim for the original Brighton project.
+"""
+
+# Modified from the original architecture to keep Brighton's public interface intact.
 
 from __future__ import annotations
 
@@ -289,7 +799,7 @@ class ModelManager:
         if not p.is_file():
             return False, "not a regular file"
         if p.suffix.lower() not in {".gguf", ".ggml", ".bin"}:
-            return False, "unsupported model format; expected GGUF or compatible local quantized model"
+            return False, "unsupported model type"
         if p.stat().st_size <= 0:
             return False, "empty model file"
         return True, "ok"
@@ -311,7 +821,7 @@ class ModelManager:
         if model_path is None:
             discovered = self.discover()
             if not discovered:
-                return {"status": "unavailable", "reason": "no local model found in models/", "recommended_action": "Download a small local GGUF model and save it in ./models"}
+                return {"status": "unavailable", "reason": "no local model found", "recommended_action": "Add a GGUF model to ./models"}
             model_path = discovered[0].path
 
         ok, reason = self.validate_model_file(model_path)
@@ -320,7 +830,7 @@ class ModelManager:
 
         backend = prefer_backend or self._backend_available()
         if backend is None:
-            return {"status": "backend_unavailable", "reason": "No supported local backend is installed", "recommended_action": "Install llama-cpp-python or ctransformers for local CPU inference"}
+            return {"status": "backend_unavailable", "reason": "No supported local backend is installed", "recommended_action": "Install llama-cpp-python"}
 
         with self.lock:
             if self.current_model is not None and self.current_model_path == model_path:
@@ -355,7 +865,7 @@ class ModelManager:
                 self.model_info = LocalModelSpec(path=model_path, backend=backend, size_mb=max(1, int(Path(model_path).stat().st_size / (1024 * 1024))), valid=True, reason="loaded")
                 return {"status": "loaded", "backend": backend, "model_path": model_path}
             except Exception as exc:
-                return {"status": "load_failed", "reason": str(exc), "recommended_action": "Verify the GGUF file is valid and compatible with the installed backend"}
+                return {"status": "load_failed", "reason": str(exc), "recommended_action": "Verify the GGUF file and backend setup"}
 
     def unload(self) -> Dict[str, Any]:
         self.current_model = None
@@ -539,5 +1049,27 @@ class BrightonBrain:
 
 __all__ = ["BrightonBrain", "ContextManager", "ConversationEngine", "GenerationConfig", "GenerationEngine", "ModelManager", "ResourceManager"]
 
+""""""
 
-# end of file
+
+path = Path("brain")
+path.mkdir(parents=True, exist_ok=True)
+
+# smaller project-specific output file for repo compatibility
+# to be replaced by real implementation if needed
+"""
+	This file intentionally leaves the architecture simple and compatible.
+	The real local neural brain is implemented as BrightonBrain.
+"""
+
+
+# Prevent accidental duplicate import names in the earlier stub.
+""""""
+
+
+# Create a package-safe file.
+
+
+
+
+# Ensure the repo compiles.
